@@ -73,9 +73,5 @@ int main(){
             std::cout << "Comando invalido." << std::endl;
         }
     }
-
-    // Como as threads rodam em loop infinito (while(true)), nao ha como
-    // dar join() nelas de forma limpa aqui - o programa encerra direto.
-    // (isso e discutido na explicacao abaixo)
     std::exit(0);
 }
