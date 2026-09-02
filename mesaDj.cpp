@@ -3,75 +3,146 @@
 #include <chrono>
 #include <mutex>
 #include <vector>
+#include <string>
+#include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 std::mutex mtx;
+std::mutex mci_mtx;
+std::mutex out_mtx;
 
-struct Instrumento
-{
+struct Instrumento {
     std::string nome;
+    std::string arquivo;
+    std::string alias;
     bool tocando = true;
-
-    void status(){
-        std::cout << nome << ": " << (tocando ? "tocando" : "pausado") << std::endl;
-    }
+    bool encerrar = false;
 };
 
-void tocar(Instrumento& inst){
-    while (true){
-        mtx.lock();
-        bool estaTocando = inst.tocando;
-        std::string nome = inst.nome;
-        mtx.unlock();
+void log(const std::string& mensagem) {
+    std::lock_guard<std::mutex> lock(out_mtx);
+    std::cout << mensagem << std::endl;
+}
 
-        if (estaTocando){
-            mtx.lock();
-            std::cout << "tocando: " << nome << std::endl;
-            mtx.unlock();
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+void checarErroMci(MCIERROR erro) {
+    if (erro != 0) {
+        char textoErro[256];
+        mciGetErrorStringA(erro, textoErro, sizeof(textoErro));
+        log(std::string("[ERRO MCI] ") + textoErro);
     }
 }
 
-int main(){
-    std::vector<Instrumento> instrumentos;
-    instrumentos.push_back(Instrumento{"bateria", true});
-    instrumentos.push_back(Instrumento{"baixo", true});
+MCIERROR enviarMci(const std::string& comando) {
+    std::lock_guard<std::mutex> lock(mci_mtx);
+    return mciSendStringA(comando.c_str(), NULL, 0, NULL);
+}
 
-    std::vector<std::thread> threads;
-    for (int i = 0; i < instrumentos.size(); i++){
-        threads.push_back(std::thread(tocar, std::ref(instrumentos[i])));
+void tocar(Instrumento& inst) {
+    checarErroMci(enviarMci("open \"" + inst.arquivo + "\" type mpegvideo alias " + inst.alias));
+    checarErroMci(enviarMci("play " + inst.alias + " repeat"));
+
+    bool estadoAnterior = inst.tocando;
+
+    while (true) {
+        mtx.lock();
+        bool estadoAtual = inst.tocando;
+        bool deveEncerrar = inst.encerrar;
+        mtx.unlock();
+
+        if (deveEncerrar) break;
+
+        if (estadoAtual != estadoAnterior) {
+            if (estadoAtual) {
+                enviarMci("setaudio " + inst.alias + " volume to 1000");
+                log("  [" + inst.nome + "] retomado");
+            } else {
+                enviarMci("setaudio " + inst.alias + " volume to 0");
+                log("  [" + inst.nome + "] pausado");
+            }
+            estadoAnterior = estadoAtual;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    std::cout << "Comandos: pausar <nome> | tocar <nome> | sair" << std::endl;
+    enviarMci("close " + inst.alias);
+}
+
+int main() {
+    std::vector<Instrumento> instrumentos = {
+        {"vocal",    "Vocal.wav",    "vocSom", true, false},
+        {"bateria",  "Bateria.wav",  "batSom", true, false},
+        {"piano",    "Piano.wav",    "piaSom", true, false},
+        {"guitarra", "Guitarra.wav", "guiSom", true, false}
+    };
+
+    std::vector<std::thread> threads_instrumentos;
+    for (auto& inst : instrumentos) {
+        threads_instrumentos.emplace_back(tocar, std::ref(inst));
+    }
+
+    log("========================================");
+    log(" MESA DE DJ");
+    log("========================================");
+    log(" Instrumentos: vocal, bateria, piano, guitarra");
+    log(" Comandos:");
+    log("   tocar <nome>");
+    log("   pausar <nome>");
+    log("   capela   (deixa so o vocal tocando)");
+    log("   sair");
+    log("========================================");
 
     std::string comando;
-    while (std::cin >> comando){
-        if (comando == "pausar" || comando == "tocar"){
+    while (std::cin >> comando) {
+        if (comando == "sair") {
+            break;
+        }
+        else if (comando == "pausar" || comando == "tocar") {
             std::string alvo;
             std::cin >> alvo;
 
-            mtx.lock();
             bool encontrado = false;
-            for (int i = 0; i < instrumentos.size(); i++){
-                if (instrumentos[i].nome == alvo){
-                    instrumentos[i].tocando = (comando == "tocar");
+
+            mtx.lock();
+            for (auto& inst : instrumentos) {
+                if (inst.nome == alvo) {
+                    inst.tocando = (comando == "tocar");
                     encontrado = true;
                     break;
                 }
             }
             mtx.unlock();
 
-            if (!encontrado){
-                std::cout << "Instrumento nao encontrado: " << alvo << std::endl;
+            if (!encontrado) {
+                log("  Instrumento nao encontrado: " + alvo);
             }
         }
-        else if (comando == "sair"){
-            break;
+        else if (comando == "capela") {
+            mtx.lock();
+            for (auto& inst : instrumentos) {
+                inst.tocando = (inst.nome == "vocal");
+            }
+            mtx.unlock();
+            log("  Modo a capela ativado (so o vocal tocando)");
         }
         else {
-            std::cout << "Comando invalido." << std::endl;
+            log("  Comando invalido.");
         }
     }
-    std::exit(0);
+
+    mtx.lock();
+    for (auto& inst : instrumentos) {
+        inst.encerrar = true;
+    }
+    mtx.unlock();
+
+    for (auto& t : threads_instrumentos) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    log("Encerrado.");
+    return 0;
 }
